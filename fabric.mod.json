@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "donutvision",
+  "version": "1.9.9",
+  "name": "DonutVision 26.1.2",
+  "description": "Fabric 26.1.2: Schematic Printer (Litematica), Discovery History, auto-attack macro, Block ESP and Base Finder.",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.donutvision.DonutVisionClient"
+    ]
+  },
+  "mixins": [
+    {
+      "config": "donutvision.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.2",
+    "minecraft": "26.1.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}

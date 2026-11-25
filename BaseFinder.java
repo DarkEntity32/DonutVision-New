@@ -1,0 +1,400 @@
+package dev.donutvision;
+
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.core.BlockPos;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.level.block.BedBlock;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.ShulkerBoxBlock;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
+import net.minecraft.world.phys.AABB;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Heuristic Base Finder. Analyzes only FULL chunks already supplied to the client.
+ * This is not a server-side scanner: scores are clues, not proof that a base exists.
+ * Scans are time-budgeted and snapshots remain visible while a new pass runs.
+ */
+public final class BaseFinder {
+    private record ChunkKey(int x, int z) { }
+    private static final int STORAGE = 0, UTILITY = 1, BED = 2, MECHANISM = 3, SPECIAL = 4;
+    private static final int CATEGORY_COUNT = 5;
+    private static final int CHUNKS_RADIUS_CAP = 32;
+    private static final int MAX_SECTIONS_PER_TICK = 48;
+    private static final long BUDGET_NS = 1_700_000L;
+    private static final int REFRESH_TICKS = 120;
+    private static final int MAX_SITES = 36;
+    // Vanilla overworld build range. Values are inclusive; the UI allows either limit.
+    public static final int Y_SLIDER_MIN = -64;
+    public static final int Y_SLIDER_MAX = 320;
+    private static final int OUTLINE_RED = 0xFFFF3535;
+    private static final int OUTLINE_OLD = 0xFFFFAB51;
+    private static final int[] RANGES = {64, 96, 128, 192, 256, 384, 512, BlockEsp.UNLIMITED};
+
+    public record Site(BlockPos pos, int score, int storages, int utilities, int devices,
+                       String label, int color, AABB region, boolean historical) {
+        public String confidence() {
+            return historical ? "Previously seen (unverified)" : confidenceLabel(score);
+        }
+    }
+
+    /** These are heuristics, never verified server-side base detections. */
+    public static String confidenceLabel(int score) {
+        return score >= Math.max(56, minScore + 20) ? "Most Likely Base" : "Maybe Base";
+    }
+
+    private static final class Snapshot {
+        final int[] counts = new int[CATEGORY_COUNT];
+        long sx, sy, sz;
+        int samples;
+        int lowestY = Integer.MAX_VALUE;
+        int highestY = Integer.MIN_VALUE;
+        void add(int x, int y, int z, int type) {
+            counts[type]++;
+            sx += x; sy += y; sz += z;
+            lowestY = Math.min(lowestY, y);
+            highestY = Math.max(highestY, y);
+            samples++;
+        }
+        void merge(Snapshot other) {
+            for (int i = 0; i < CATEGORY_COUNT; i++) counts[i] += other.counts[i];
+            sx += other.sx; sy += other.sy; sz += other.sz;
+            lowestY = Math.min(lowestY, other.lowestY);
+            highestY = Math.max(highestY, other.highestY);
+            samples += other.samples;
+        }
+        int count(int type) { return counts[type]; }
+        int score() {
+            int storage = Math.min(60, count(STORAGE) * 6);
+            int utility = Math.min(20, count(UTILITY) * 3);
+            int beds = Math.min(16, count(BED) * 4);
+            int mechanism = Math.min(24, count(MECHANISM) * 4);
+            int special = Math.min(40, count(SPECIAL) * 12);
+            int combined = count(STORAGE) >= 2 && (count(UTILITY) > 0 || count(MECHANISM) > 0) ? 8 : 0;
+            return storage + utility + beds + mechanism + special + combined;
+        }
+    }
+
+    private static boolean enabled;
+    private static boolean tracers = false;
+    private static boolean alerts = true;
+    private static int radius = 192;
+    private static int minScore = 24;
+    private static int minY = -64;
+    private static int maxY = 0;
+    private static ClientLevel currentLevel;
+    private static final Map<ChunkKey, Snapshot> snapshots = new HashMap<>();
+    private static final Set<ChunkKey> alertedChunks = new HashSet<>();
+    private static List<Site> sites = List.of();
+    private static List<ChunkKey> scanChunks = List.of();
+    private static int chunkIndex, sectionIndex, sinceRefresh = REFRESH_TICKS;
+    private static int[] order = new int[0];
+    private static boolean scanning;
+    private static Snapshot partial = new Snapshot();
+    private static BlockPos scanCenter = BlockPos.ZERO;
+    private static long lastAlertMillis;
+
+    private BaseFinder() { }
+
+    public static boolean enabled() { return enabled; }
+    public static void setEnabled(boolean value) {
+        if (enabled != value) {
+            enabled = value;
+            if (enabled) restart();
+            else sites = List.of();
+        }
+    }
+    public static void toggle() { setEnabled(!enabled); ClientSettings.save(); }
+    // Base markers are red outlines only (no tracer lines).
+    public static boolean tracers() { return false; }
+    public static void setTracers(boolean ignored) { tracers = false; }
+    public static void toggleTracers() { tracers = false; ClientSettings.save(); }
+    public static boolean alerts() { return alerts; }
+    public static void setAlerts(boolean value) { alerts = value; }
+    public static void toggleAlerts() { alerts = !alerts; ClientSettings.save(); }
+    public static int radius() { return radius; }
+    public static int radiusStepIndex() {
+        for (int i = 0; i < RANGES.length; i++) if (RANGES[i] == radius) return i;
+        return 3;
+    }
+    public static int radiusSteps() { return RANGES.length; }
+    public static void setRadiusStep(int step) { setRadius(RANGES[Math.max(0, Math.min(RANGES.length - 1, step))]); }
+    public static void setRadius(int range) {
+        radius = range == BlockEsp.UNLIMITED ? range : Math.max(64, Math.min(512, range));
+        restart();
+    }
+    public static String radiusLabel() { return radius == BlockEsp.UNLIMITED ? "all loaded chunks" : radius + " blocks"; }
+    public static int minY() { return minY; }
+    public static int maxY() { return maxY; }
+    public static void setMinY(int value) { setYRange(value, maxY); }
+    public static void setMaxY(int value) { setYRange(minY, value); }
+    /** Inclusive Y boundaries. A handle never crosses the other handle. */
+    public static void setYRange(int from, int to) {
+        int low = Math.max(Y_SLIDER_MIN, Math.min(Y_SLIDER_MAX, from));
+        int high = Math.max(Y_SLIDER_MIN, Math.min(Y_SLIDER_MAX, to));
+        if (low > high) {
+            // Keep the bound being adjusted inside the existing interval.
+            if (from != minY && to == maxY) low = high;
+            else if (to != maxY && from == minY) high = low;
+            else { int swap = low; low = high; high = swap; }
+        }
+        if (minY == low && maxY == high) return;
+        minY = low;
+        maxY = high;
+        // Scores and positions depend on Y. Never reuse old-range snapshots/alerts.
+        clear();
+    }
+    public static int minScore() { return minScore; }
+    /** Higher sensitivity allows MORE possible bases; it never changes scan distance. */
+    public static int sensitivity() {
+        return Math.round((72 - minScore) * 100.0f / 60.0f);
+    }
+    public static void setSensitivity(int percent) {
+        int clamped = Math.max(0, Math.min(100, percent));
+        setMinScore(72 - Math.round(clamped * 60.0f / 100.0f));
+    }
+    /** Kept for compatibility with existing donutvision.properties settings files. */
+    public static void setMinScore(int value) {
+        int next = Math.max(12, Math.min(72, value));
+        if (minScore == next) return;
+        minScore = next;
+        // Re-filter existing cached chunks immediately. No rescan needed.
+        if (enabled && currentLevel != null) publish(currentLevel, scanCenter);
+    }
+    public static List<Site> sites() { return sites; }
+    public static boolean scanning() { return scanning; }
+    public static int scannedChunks() { return snapshots.size(); }
+
+    public static void clear() {
+        snapshots.clear();
+        alertedChunks.clear();
+        sites = List.of();
+        restart();
+    }
+    public static void onWorldGone() {
+        clear();
+        currentLevel = null;
+    }
+    private static void restart() {
+        scanning = false;
+        scanChunks = List.of();
+        chunkIndex = sectionIndex = 0;
+        partial = new Snapshot();
+        sinceRefresh = REFRESH_TICKS;
+    }
+
+    public static void tick(Minecraft mc) {
+        if (mc.level == null || mc.player == null) {
+            if (currentLevel != null) onWorldGone();
+            return;
+        }
+        if (currentLevel != mc.level) {
+            onWorldGone();
+            currentLevel = mc.level;
+        }
+        if (!enabled) return;
+        ClientLevel level = mc.level;
+        BlockPos center = mc.player.blockPosition();
+        if (Math.abs(center.getX() - scanCenter.getX()) > 32
+                || Math.abs(center.getZ() - scanCenter.getZ()) > 32) restart();
+        if (!scanning && ++sinceRefresh >= REFRESH_TICKS) begin(level, center);
+        long deadline = System.nanoTime() + BUDGET_NS;
+        int processed = 0;
+        boolean changed = false;
+        while (scanning && processed < MAX_SECTIONS_PER_TICK && System.nanoTime() < deadline) {
+            if (chunkIndex >= scanChunks.size()) {
+                scanning = false;
+                sinceRefresh = 0;
+                break;
+            }
+            ChunkKey key = scanChunks.get(chunkIndex);
+            LevelChunk chunk = level.getChunkSource().getChunk(key.x, key.z, ChunkStatus.FULL, false);
+            if (chunk == null) {
+                snapshots.remove(key);
+                advanceChunk();
+                changed = true;
+                continue;
+            }
+            LevelChunkSection[] sections = chunk.getSections();
+            if (sectionIndex >= order.length) {
+                snapshots.put(key, partial);
+                changed = true;
+                advanceChunk();
+                continue;
+            }
+            int index = order[sectionIndex++];
+            if (index < 0 || index >= sections.length) continue;
+            processed++;
+            LevelChunkSection section = sections[index];
+            if (section.hasOnlyAir() || !section.maybeHas(s -> category(s.getBlock()) >= 0)) continue;
+            int originX = key.x << 4;
+            int originY = level.getSectionYFromSectionIndex(index) << 4;
+            int originZ = key.z << 4;
+            // Discard sections completely outside the selected band.
+            if (originY + 15 < minY || originY > maxY) continue;
+            int localStart = Math.max(0, minY - originY);
+            int localEnd = Math.min(15, maxY - originY);
+            for (int y = localStart; y <= localEnd; y++)
+                for (int x = 0; x < 16; x++) for (int z = 0; z < 16; z++) {
+                    int category = category(section.getBlockState(x, y, z).getBlock());
+                    if (category >= 0) partial.add(originX + x, originY + y, originZ + z, category);
+                }
+        }
+        if (changed || mc.player.tickCount % 20 == 0) publish(level, center);
+    }
+
+    private static void advanceChunk() {
+        chunkIndex++;
+        sectionIndex = 0;
+        partial = new Snapshot();
+    }
+
+    private static void begin(ClientLevel level, BlockPos center) {
+        scanCenter = center.immutable();
+        sinceRefresh = 0;
+        chunkIndex = sectionIndex = 0;
+        partial = new Snapshot();
+        int distance = radius == BlockEsp.UNLIMITED ? CHUNKS_RADIUS_CAP
+                : Math.min(CHUNKS_RADIUS_CAP, (radius + 15) / 16 + 1);
+        int centerX = center.getX() >> 4, centerZ = center.getZ() >> 4;
+        ArrayList<ChunkKey> available = new ArrayList<>();
+        for (int x = centerX - distance; x <= centerX + distance; x++) {
+            for (int z = centerZ - distance; z <= centerZ + distance; z++) {
+                if (level.getChunkSource().getChunk(x, z, ChunkStatus.FULL, false) != null)
+                    available.add(new ChunkKey(x, z));
+            }
+        }
+        available.sort(Comparator.comparingLong(k ->
+                (long)(k.x - centerX) * (k.x - centerX) + (long)(k.z - centerZ) * (k.z - centerZ)));
+        scanChunks = List.copyOf(available);
+        // Only traverse sections intersecting the inclusive user-selected Y interval.
+        ArrayList<Integer> sectionOrder = new ArrayList<>();
+        for (int i = 0; i < level.getSectionsCount(); i++) {
+            int sectionY = level.getSectionYFromSectionIndex(i) << 4;
+            if (sectionY <= maxY && sectionY + 15 >= minY) sectionOrder.add(i);
+        }
+        sectionOrder.sort(Comparator.comparingInt(i ->
+                Math.abs((level.getSectionYFromSectionIndex(i) << 4) + 8 - center.getY())));
+        order = new int[sectionOrder.size()];
+        for (int i = 0; i < order.length; i++) order[i] = sectionOrder.get(i);
+        scanning = !scanChunks.isEmpty();
+    }
+
+    private static void publish(ClientLevel level, BlockPos center) {
+        // Drop old chunks only after they are really unloaded; moving doesn't clear results.
+        snapshots.keySet().removeIf(key ->
+                level.getChunkSource().getChunk(key.x, key.z, ChunkStatus.FULL, false) == null);
+        ArrayList<Site> candidates = new ArrayList<>();
+        for (Map.Entry<ChunkKey, Snapshot> entry : snapshots.entrySet()) {
+            ChunkKey key = entry.getKey();
+            Snapshot s = entry.getValue();
+            if (s.samples == 0) continue;
+            long dx = ((long)key.x << 4) + 8 - center.getX();
+            long dz = ((long)key.z << 4) + 8 - center.getZ();
+            if (radius != BlockEsp.UNLIMITED && (Math.abs(dx) > radius + 16 || Math.abs(dz) > radius + 16)) continue;
+            int score = s.score();
+            if (score < minScore) continue;
+            int x = (int)(s.sx / s.samples), y = (int)(s.sy / s.samples), z = (int)(s.sz / s.samples);
+            String label = s.count(STORAGE) >= 4 && s.count(UTILITY) == 0 ? "Storage stash"
+                    : s.count(MECHANISM) >= 4 ? "Redstone build"
+                    : s.count(SPECIAL) > 0 ? "Advanced base" : "Possible base";
+            // Each site is framed by a large cube around its chunk, centred on the
+            // actual vertical band of observed evidence (not the world's surface).
+            // Keep the box within the user's Y-from / Y-to filter.
+            int chunkX = key.x << 4, chunkZ = key.z << 4;
+            int minBoxY = Math.max(minY, Math.min(s.lowestY - 3, y - 8));
+            int maxBoxY = Math.min(maxY + 1, Math.max(s.highestY + 4, minBoxY + 16));
+            // Avoid enormous shafts when scattered signals occupy many heights.
+            if (maxBoxY - minBoxY > 32) {
+                minBoxY = Math.max(minY, y - 16);
+                maxBoxY = Math.min(maxY + 1, y + 16);
+            }
+            if (maxBoxY <= minBoxY) maxBoxY = minBoxY + 1;
+            AABB region = new AABB(chunkX - 2, minBoxY, chunkZ - 2,
+                    chunkX + 18, maxBoxY, chunkZ + 18);
+            candidates.add(new Site(new BlockPos(x,y,z), score, s.count(STORAGE),
+                    s.count(UTILITY) + s.count(BED), s.count(MECHANISM), label, OUTLINE_RED, region, false));
+        }
+        // Keep an archive of earlier client observations. They can be stale if a
+        // player moved the base or if the server no longer reveals the blocks.
+        for (Site found : candidates) {
+            if (found.score() >= Math.max(36, minScore)) DiscoveryHistory.rememberBase(found);
+        }
+        for (DiscoveryHistory.KnownBase old : DiscoveryHistory.bases()) {
+            if (old.score() < minScore || old.y() < minY || old.y() > maxY) continue;
+            long dx = (long)old.x() - center.getX();
+            long dz = (long)old.z() - center.getZ();
+            if (radius != BlockEsp.UNLIMITED && (Math.abs(dx) > radius + 16
+                    || Math.abs(dz) > radius + 16)) continue;
+            boolean live = false;
+            for (Site candidate : candidates) {
+                if ((candidate.pos().getX() >> 4) == (old.x() >> 4)
+                        && (candidate.pos().getZ() >> 4) == (old.z() >> 4)) {
+                    live = true;
+                    break;
+                }
+            }
+            if (!live) candidates.add(new Site(old.pos(), old.score(), old.storages(),
+                    old.utilities(), old.devices(), "Last observed", OUTLINE_OLD,
+                    old.region(), true));
+        }
+        candidates.sort(Comparator.comparingInt(Site::score).reversed());
+        ArrayList<Site> result = new ArrayList<>();
+        for (Site candidate : candidates) {
+            boolean duplicate = false;
+            for (Site existing : result) {
+                long dx = (long)existing.pos.getX() - candidate.pos.getX();
+                long dz = (long)existing.pos.getZ() - candidate.pos.getZ();
+                if (dx * dx + dz * dz < 32L * 32L) { duplicate = true; break; }
+            }
+            if (!duplicate) result.add(candidate);
+            if (result.size() >= MAX_SITES) break;
+        }
+        result.sort(Comparator.comparingDouble(s -> s.pos.distSqr(center)));
+        sites = List.copyOf(result);
+        if (alerts && !sites.isEmpty()) {
+            for (Site site : sites) {
+                ChunkKey key = new ChunkKey(site.pos.getX() >> 4, site.pos.getZ() >> 4);
+                if (site.historical() || site.score < minScore + 12 || alertedChunks.contains(key)) continue;
+                long now = System.currentTimeMillis();
+                if (now - lastAlertMillis < 5000) break;
+                alertedChunks.add(key);
+                lastAlertMillis = now;
+                Minecraft mc = Minecraft.getInstance();
+                if (mc.player != null) mc.player.sendSystemMessage(Component.literal(
+                        "[DonutVision] " + site.label + " at X " + site.pos.getX()
+                                + ", Z " + site.pos.getZ() + " (score " + site.score + ")"));
+                break;
+            }
+        }
+    }
+
+    /** Signals chosen to avoid treating natural ore veins as bases. */
+    private static int category(Block block) {
+        if (block == Blocks.CHEST || block == Blocks.TRAPPED_CHEST || block == Blocks.BARREL
+                || block == Blocks.ENDER_CHEST || block instanceof ShulkerBoxBlock) return STORAGE;
+        if (block == Blocks.CRAFTING_TABLE || block == Blocks.FURNACE || block == Blocks.BLAST_FURNACE
+                || block == Blocks.SMOKER || block == Blocks.BREWING_STAND
+                || block == Blocks.STONECUTTER || block == Blocks.GRINDSTONE
+                || block == Blocks.SMITHING_TABLE || block == Blocks.ANVIL
+                || block == Blocks.CHIPPED_ANVIL || block == Blocks.DAMAGED_ANVIL) return UTILITY;
+        if (block instanceof BedBlock) return BED;
+        if (block == Blocks.HOPPER || block == Blocks.PISTON || block == Blocks.STICKY_PISTON
+                || block == Blocks.OBSERVER || block == Blocks.DISPENSER || block == Blocks.DROPPER
+                || block == Blocks.REPEATER || block == Blocks.COMPARATOR || block == Blocks.REDSTONE_BLOCK) return MECHANISM;
+        if (block == Blocks.BEACON || block == Blocks.ENCHANTING_TABLE
+                || block == Blocks.NETHER_PORTAL || block == Blocks.LODESTONE) return SPECIAL;
+        return -1;
+    }
+}
