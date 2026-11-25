@@ -1,0 +1,66 @@
+name: Build DonutVision-New 1.9.9
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout new repository
+        uses: actions/checkout@v4
+
+      - name: Verify files are in the REPOSITORY ROOT
+        shell: bash
+        run: |
+          test -f build.gradle || (echo 'ERROR: build.gradle must be in repository root' && exit 1)
+          test -f src/client/java/dev/donutvision/SchematicAssist.java || (echo 'ERROR: Printer source not found' && exit 1)
+          test -f src/client/java/dev/donutvision/DonutVisionScreen.java || (echo 'ERROR: GUI source not found' && exit 1)
+          test ! -d DonutVision-26.1.2 || (echo 'ERROR: old nested source folder present' && exit 1)
+          grep -q '^mod_version=1.9.9$' gradle.properties || (echo 'ERROR: wrong mod_version' && exit 1)
+          grep -q 'Schematic Printer' src/client/java/dev/donutvision/DonutVisionScreen.java || exit 1
+          echo 'Root folder and Printer GUI sources OK'
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.6.1'
+
+      - name: Compile Fabric mod
+        run: gradle --no-daemon clean build --stacktrace
+
+      - name: Verify distributable JAR is new and has Printer
+        shell: python
+        run: |
+          import glob, json, zipfile
+          expected='build/libs/donutvision-26.1.2-1.9.9.jar'
+          assert glob.glob('build/libs/*.jar'), 'Gradle created no JAR'
+          with zipfile.ZipFile(expected) as z:
+              entries=set(z.namelist())
+              for needed in (
+                  'fabric.mod.json',
+                  'dev/donutvision/DonutVisionClient.class',
+                  'dev/donutvision/DonutVisionScreen.class',
+                  'dev/donutvision/SchematicAssist.class',
+              ):
+                  assert needed in entries, f'Missing class/file: {needed}'
+              meta=json.loads(z.read('fabric.mod.json'))
+              assert meta['id']=='donutvision' and meta['version']=='1.9.9', meta
+              client=z.read('dev/donutvision/DonutVisionClient.class')
+              assert b'v1.9.9 loaded!' in client, 'Old startup message found in client'
+          print('OK: VERIFIED DonutVision v1.9.9, Schematic Printer present')
+
+      - name: Upload verified JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: DonutVision-New-1.9.9-JAR
+          path: build/libs/donutvision-26.1.2-1.9.9.jar
+          if-no-files-found: error
